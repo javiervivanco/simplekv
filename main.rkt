@@ -1,7 +1,7 @@
 #lang racket/base
 (require racket/file racket/path racket/string)
 
-(provide kv-origin kv-ref kv-set! kv-del!  kv-keys)
+(provide kv-origin kv-ref kv-set! kv-del! kv-ref! kv-key?  kv-keys)
 
 (define kv-origin (make-parameter #f))
 
@@ -24,23 +24,31 @@
    #:lock-file (key->lock id)
    (key->path id)
    'exclusive
-   (lambda ()
-     (let ([out (open-output-file (key->path id) #:exists 'replace)])
-       (write val out)
-       (close-output-port out))
-     )
+   (lambda () (write-to-file val (key->path id) #:exists 'replace ))
    (lambda () (error "Failed to obtain lock for file" (key->path id)))))
- 
-(define (kv-ref id )
+
+(define (kv-key? id)
+  (file-exists? (key->path id)))
+
+(define (kv-ref! id to-set)
+  (cond
+    [(kv-key? id) (kv-ref id)]
+    [else (kv-set! id to-set)
+          to-set]))
+
+(define (kv-ref id [default (lambda () (error "no value found for key: " id))])
   (kv-origin-check!)
-  (call-with-file-lock/timeout
-   #:max-delay 200
-   #:delay 0.2
-   #:lock-file (key->lock id)
-   (key->path id)
-   'shared
-   (lambda () (file->value (key->path id)))
-   (lambda () (error "Failed to obtain lock for file" (key->path id)))))
+  (cond [ (kv-key? id) 
+          (call-with-file-lock/timeout
+           #:max-delay 200
+           #:delay 0.2
+           #:lock-file (key->lock id)
+           (key->path id)
+           'shared
+           (lambda () (let([value (file->value (key->path id))]) value))
+           (lambda () (error "Failed to obtain lock for file" (key->path id))))]
+        [(procedure? default) (default)]
+        [else default]))
   
   
 (define (kv-keys )
