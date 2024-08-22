@@ -1,9 +1,21 @@
 #lang racket/base
 (require racket/file racket/path racket/string)
 
-(provide kv-origin kv-ref kv-set! kv-del! kv-ref! kv-key?  kv-keys)
+(provide kv-origin kv-ref kv-set! kv-del! kv-ref! kv-key?  kv-keys kv-incr!  kv-append! k k! K! k? )
 
 (define kv-origin (make-parameter #f))
+
+(define-syntax-rule (k ID BODY ...)
+  (kv-ref 'ID BODY ...))
+
+(define-syntax-rule (k! ID BODY ...)
+  (kv-ref! 'ID BODY ...))
+
+(define-syntax-rule (K! ID VAL)
+  (kv-set! 'ID VAL))
+
+(define-syntax-rule (k? )
+  (kv-key? 'ID ))
 
 (define (kv-origin-check! )
   (unless (kv-origin) (error "undefined kv-origin " ))
@@ -72,6 +84,13 @@
    (lambda () (error "Failed to obtain lock for file" (key->path id)))))
 
 
+(define (kv-incr! key)
+  (kv-set! key (add1 (kv-ref! key -1)))
+  (kv-ref key))
+
+(define (kv-append! key . args)
+  (kv-set! key (append (kv-ref key '()) args ))
+  (kv-ref key))
 
 (module+ test
   (require rackunit)
