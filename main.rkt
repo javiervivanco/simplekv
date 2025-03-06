@@ -1,7 +1,9 @@
 #lang racket/base
-(require racket/file racket/path racket/string)
+(require racket/file racket/path racket/string racket/system)
 
-(provide kv-origin kv-ref kv-set! kv-del! kv-ref! kv-key?  kv-keys kv-incr!  kv-append! k k! K! k? )
+(define max-delay (make-parameter 5))
+(define k-delay (make-parameter 0.1))
+(provide kv-origin kv-ref kv-set! kv-del! kv-ref! kv-key?  kv-keys kv-incr!  kv-append! k k! K! k? kv-remove! q-pop q-push key->path)
 
 (define kv-origin (make-parameter #f))
 
@@ -14,55 +16,60 @@
 (define-syntax-rule (K! ID VAL)
   (kv-set! 'ID VAL))
 
-(define-syntax-rule (k? )
+(define-syntax-rule (k? ID )
   (kv-key? 'ID ))
 
 (define (kv-origin-check! )
   (unless (kv-origin) (error "undefined kv-origin " ))
   (unless (directory-exists? (kv-origin)) (make-directory* (kv-origin))))
-      
 
-(define (key->path id)
-  (build-path (kv-origin) (string-append (symbol->string id) ".rktd")))
 
-(define (key->lock id)
-  (build-path (kv-origin) (string-append (symbol->string id) ".LOCK")))
+(define (key->path key)
+  (build-path (kv-origin) (string-append (symbol->string key) ".rktd")))
 
-(define (kv-set! id val)
+(define (key->lock key)
+  (build-path (kv-origin) (string-append (symbol->string key) ".LOCK")))
+
+
+(define (kv-exclusive key process)
   (kv-origin-check!)
+  (define apath (key->path key))
   (call-with-file-lock/timeout
-   #:max-delay 200
-   #:delay 0.2
-   #:lock-file (key->lock id)
-   (key->path id)
+   #:max-delay (max-delay)
+   #:delay (k-delay)
+   #:lock-file (key->lock key)
+   apath
    'exclusive
-   (lambda () (write-to-file val (key->path id) #:exists 'replace ))
-   (lambda () (error "Failed to obtain lock for file" (key->path id)))))
+   process
+   (lambda () (error "Failed to obtain lock for file" apath))))
 
-(define (kv-key? id)
-  (file-exists? (key->path id)))
-
-(define (kv-ref! id to-set)
-  (cond
-    [(kv-key? id) (kv-ref id)]
-    [else (kv-set! id to-set)
-          to-set]))
-
-(define (kv-ref id [default (lambda () (error "no value found for key: " id))])
+(define (kv-shared key process)
   (kv-origin-check!)
-  (cond [ (kv-key? id) 
-          (call-with-file-lock/timeout
-           #:max-delay 200
-           #:delay 0.2
-           #:lock-file (key->lock id)
-           (key->path id)
-           'shared
-           (lambda () (let([value (file->value (key->path id))]) value))
-           (lambda () (error "Failed to obtain lock for file" (key->path id))))]
-        [(procedure? default) (default)]
-        [else default]))
-  
-  
+  (define apath (key->path key))
+  (call-with-file-lock/timeout
+   #:max-delay (max-delay)
+   #:delay (k-delay)
+   #:lock-file (key->lock key)
+   apath
+   'shared
+   process
+   (lambda () (error "Failed to obtain lock for file" apath))))
+
+(define (kv-value-write key val)
+  (write-to-file val (key->path key) #:exists 'replace ))
+
+(define (kv-value-read key)
+  (let([value (file->value (key->path key))]) value))
+
+(define (kv-value-ref key default)
+  (cond
+    [(kv-key? key) (kv-value-read key )]
+    [else         default]))
+
+
+(define (kv-key? key)
+  (file-exists? (key->path key)))
+
 (define (kv-keys )
   (kv-origin-check!)
   (define (data? a-path)
@@ -72,25 +79,66 @@
   (map car (map file->key (filter  data? (directory-list (kv-origin))) )))
 
 
-(define (kv-del! id)
-  (kv-origin-check!)
-  (call-with-file-lock/timeout
-   #:max-delay 200
-   #:delay 0.2
-   #:lock-file (key->lock id)
-   (key->path id)
-   'exclusive
-   (lambda () (delete-file  (key->path id)))
-   (lambda () (error "Failed to obtain lock for file" (key->path id)))))
+(define (kv-set! key val)
+  (kv-exclusive key (lambda () (kv-value-write  key val))))
+
+(define (kv-ref key [default (lambda () (error "no value found for key: " key))])
+  (cond [(kv-key? key)         (kv-shared key (lambda () (kv-value-read key)))]
+        [(procedure? default) (default)]
+        [else                  default]))
+
+
+(define (kv-ref! key to-set)
+  (kv-exclusive key
+   (λ ()
+     (cond
+       [(kv-key? key) (kv-value-read key)]
+       [else         (kv-value-write key to-set)
+                     to-set]))))
+
+ 
+(define (kv-del! key)
+  (kv-exclusive key (lambda () (delete-file  (key->path key)))))
+
 
 
 (define (kv-incr! key)
-  (kv-set! key (add1 (kv-ref! key -1)))
-  (kv-ref key))
+  (kv-exclusive key (λ () (kv-value-write key (add1 (kv-value-ref key -1))))))
+  
+
 
 (define (kv-append! key . args)
-  (kv-set! key (append (kv-ref key '()) args ))
-  (kv-ref key))
+  (kv-exclusive key  (λ () (kv-value-write key (append (kv-value-ref key '()) args )))))
+
+(define (kv-member key val)
+  (kv-shared key (λ () (member val (kv-value-ref key '())))))
+
+
+(define (kv-remove! key id)
+  (kv-exclusive key  (λ () (kv-value-write key (remove id (kv-value-ref key '()) )))))
+  
+
+
+(define (q-push queue value)
+  (unless (kv-member '~queues queue) (kv-append! '~queues  queue))
+  (kv-append! queue value)
+  (void))
+
+(define (q-pop queue-name)
+  (kv-exclusive queue-name
+   (λ ()
+     (define queue (kv-value-ref queue-name '()))
+     (if (null? queue)
+         (void)
+         (begin
+           (kv-value-write queue-name  (cdr queue))
+           (car queue))))))
+
+(define (q-pending queue)
+  (kv-ref! queue '()))
+
+
+;:(define (q-consumed 'queue)
 
 (module+ test
   (require rackunit)
@@ -104,7 +152,12 @@
   (check-true  (list? (member 'key (kv-keys) )))
   (check-false  (member 'keydsds (kv-keys) ))
   (kv-set! 'val-hash (make-hash '((cu . 10))))
-  
+
   (kv-del! 'key)
   (kv-del! 'key1)
+  (q-push 'queue 1)
+  (q-pop 'queue )
+  ;;(q-all 'queue)
+  (q-pending 'queue)
+  ;;(q-consumed 'queue)
   )
